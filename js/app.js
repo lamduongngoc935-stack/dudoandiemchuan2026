@@ -847,10 +847,11 @@ function showToast(message, type = 'error') {
 
 // ─── Anti-Spam: Contribute Data (Crowdsourcing) ───
 // Mỗi thiết bị/IP chỉ được đóng góp 1 lần duy nhất.
-// Lớp 1: localStorage  → chặn ngay trên trình duyệt
-// Lớp 2: Firebase      → lưu fingerprint IP, kiểm tra chéo
+// Lớp 0: RAM flag     → chặn ngay trong session (không thể bypass)
+// Lớp 1: localStorage → chặn trên cùng trình duyệt
+// Lớp 2: Firebase     → lưu fingerprint IP, kiểm tra chéo
 const CONTRIBUTED_KEY = 'bkhn_contributed_v1';
-const SPAM_COOLDOWN_MS = 0; // 0 = 1 lần vĩnh viễn
+let _sessionContributed = false; // In-memory, reset khi F5 nhưng không thể bypass trong session
 
 /** Sinh fingerprint nhẹ từ trình duyệt (không cần thư viện) */
 function getBrowserFingerprint() {
@@ -909,8 +910,16 @@ function openContributeModal() {
     return;
   }
 
+  // ── Lớp 0: kiểm tra RAM flag (không thể bypass trong session) ──
+  if (_sessionContributed) {
+    showToast('⚠️ Bạn đã đóng góp trong phiên này rồi! Cảm ơn bạn!', 'error');
+    return;
+  }
+
   // ── Lớp 1: kiểm tra localStorage ngay lập tức ──
   if (hasContributedLocally()) {
+    _sessionContributed = true; // đồng bộ flag
+    disableContributeButton();  // khóa nút luôn
     showToast('⚠️ Mỗi người chỉ được đóng góp 1 lần để đảm bảo tính chính xác của dữ liệu. Cảm ơn bạn!', 'error');
     return;
   }
@@ -940,12 +949,25 @@ async function executeContribute() {
   const oldText = btn.innerText;
   const oldBg = btn.style.background;
 
-  // ── Lớp 1: Double-check localStorage trước khi gửi ──
-  if (hasContributedLocally()) {
-    showToast('⚠️ Bạn đã đóng góp rồi! Mỗi người chỉ được đóng góp 1 lần.', 'error');
+  // ── Lớp 0: Double-check RAM flag (không thể bypass) ──
+  if (_sessionContributed) {
+    showToast('⚠️ Bạn đã đóng góp trong phiên này rồi!', 'error');
     closeContributeModal();
     return;
   }
+
+  // ── Lớp 1: Double-check localStorage trước khi gửi ──
+  if (hasContributedLocally()) {
+    _sessionContributed = true; // đồng bộ flag
+    showToast('⚠️ Bạn đã đóng góp rồi! Mỗi người chỉ được đóng góp 1 lần.', 'error');
+    closeContributeModal();
+    disableContributeButton();
+    return;
+  }
+
+  // ── ĐẶT FLAG NGAY LẬP TỨC trước mọi thao tác async ──
+  // Điều này ngăn double-click và race condition trong cùng session
+  _sessionContributed = true;
 
   btn.innerText = 'Đang kiểm tra...';
   btn.style.opacity = '0.7';
@@ -961,57 +983,74 @@ async function executeContribute() {
     const snapshot = await spamRef.once('value');
     if (snapshot.exists()) {
       // IP + fingerprint này đã từng đóng góp → chặn
-      markContributedLocally(); // đồng bộ localStorage
+      markContributedLocally();
       showToast('⚠️ Mỗi người chỉ được đóng góp 1 lần để đảm bảo tính chính xác. Cảm ơn bạn!', 'error');
-      btn.innerText = oldText;
-      btn.style.background = oldBg;
-      btn.style.opacity = '1';
-      btn.disabled = false;
+      disableContributeButton();
       closeContributeModal();
       return;
     }
   } catch (err) {
-    // Nếu không đọc được Firebase (offline/lỗi), vẫn cho phép gửi
-    console.warn('spam_guard check failed, proceeding:', err);
+    // Firebase Rules chặn đọc spam_guard → có thể là do Rules chưa cấu hình đúng.
+    // Trong trường hợp này, vẫn tiếp tục nhưng ghi chú lại.
+    // Nếu muốn an toàn tuyệt đối, uncomment dòng dưới để chặn luôn:
+    // showToast('Không thể xác minh. Vui lòng thử lại sau!', 'error');
+    // _sessionContributed = false; btn.disabled = false; btn.innerText = oldText; return;
+    console.warn('spam_guard read failed (possible Rules config issue):', err.message);
   }
 
   btn.innerText = 'Đang đẩy dữ liệu...';
 
-  // ── Bước 1: Ghi contribution (quan trọng nhất) ──
+  // ── Bước 1: Ghi contribution ──
   db.ref('contributions').push({
     score: state.finalScore,
     method: state.method,
     aspirations: state.aspirations,
+    fp: fp, // lưu fingerprint để phân tích
     timestamp: firebase.database.ServerValue.TIMESTAMP
   })
     .then(() => {
-      // ── Bước 2: Ghi spam_guard (best-effort – lỗi rules thì bỏ qua) ──
+      // ── Bước 2: Ghi spam_guard ──
       db.ref('spam_guard/' + spamKey).set({
         ts: firebase.database.ServerValue.TIMESTAMP
       }).catch(err => {
-        // Firebase Rules có thể chặn spam_guard → không sao, localStorage vẫn bảo vệ
-        console.warn('spam_guard write blocked (rules), localStorage still active:', err.message);
+        console.warn('spam_guard write blocked (check Firebase Rules):', err.message);
       });
 
-      markContributedLocally(); // Luôn đánh dấu localStorage sau khi contribution thành công
-      btn.innerText = '✅ Cảm ơn bạn!';
+      markContributedLocally();
+      btn.innerText = '✅ Cảm ơn bạn đã đóng góp!';
       btn.style.background = '#10b981';
+      btn.style.color = '#fff';
       btn.style.opacity = '1';
+      // KHÔNG re-enable button — khóa vĩnh viễn trong session này
       setTimeout(() => {
-        btn.innerText = oldText;
-        btn.style.background = oldBg;
-        btn.disabled = false;
+        disableContributeButton();
         closeContributeModal();
-      }, 1500);
+      }, 2000);
     })
     .catch(err => {
       console.error(err);
-      showToast('Có lỗi xảy ra khi kết nối máy chủ!', 'error');
+      // Gửi thất bại → reset flag để cho phép thử lại
+      _sessionContributed = false;
+      showToast('Có lỗi xảy ra khi kết nối máy chủ! Vui lòng thử lại.', 'error');
       btn.innerText = oldText;
       btn.style.background = oldBg;
       btn.style.opacity = '1';
       btn.disabled = false;
     });
+}
+
+/** Vô hiệu hóa nút đóng góp vĩnh viễn trong session này */
+function disableContributeButton() {
+  // Ẩn tất cả các nút mở modal đóng góp
+  const btns = document.querySelectorAll('[onclick="openContributeModal()"], [data-contribute]');
+  btns.forEach(b => {
+    b.disabled = true;
+    b.style.opacity = '0.5';
+    b.style.cursor = 'not-allowed';
+    b.title = 'Bạn đã đóng góp rồi!';
+    // Xóa onclick để không thể gọi lại
+    b.setAttribute('onclick', 'showToast(\'⚠️ Bạn đã đóng góp rồi! Cảm ơn bạn.\', \'error\')');
+  });
 }
 
 // ─── Firebase Algorithm & Real-time Sync ──────────
@@ -1227,6 +1266,12 @@ document.addEventListener('DOMContentLoaded', () => {
   initFirebaseSync();
   updateCounterUI();
   loadFromURL();
+
+  // Disable contribute button ngay khi load nếu đã đóng góp rồi
+  if (hasContributedLocally()) {
+    _sessionContributed = true;
+    disableContributeButton();
+  }
   
   if (state.rawScore !== null) {
     calculateFinalScore();

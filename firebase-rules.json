@@ -1,0 +1,18 @@
+{
+  "rules": {
+    "contributions": {
+      ".read": false,
+      ".write": true
+    },
+    "spam_guard": {
+      "$key": {
+        ".read": true,
+        ".write": "!data.exists()"
+      }
+    },
+    "chat": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}
